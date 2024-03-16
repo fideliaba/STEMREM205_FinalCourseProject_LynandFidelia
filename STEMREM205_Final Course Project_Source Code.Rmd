@@ -1,0 +1,403 @@
+---
+title: "STEMREM205_FinalCourseProject_SourceCode"
+output: html_document
+date: "2024-03-16"
+---
+
+```{r}
+#Load Required Libraries 
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(Matrix)
+library(ggplot2)
+library(CytoTRACE)
+library(reticulate)
+library(rstatix)
+library(ggpubr)
+library(CellChat)
+library(NMF)
+library(ggalluvial)
+library(ComplexHeatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(EnhancedVolcano)
+
+#set seed 
+set.seed(13)
+```
+
+
+
+```{r}
+#Loading of Dataset and Clean Up of Data 
+#read the matrix, create object 
+matrix <- ReadMtx("/oak/stanford/groups/amnewman/fidelia/Exp_data_UMIcounts2.mtx", 
+                   "/oak/stanford/groups/amnewman/fidelia/Cells2Names.csv", 
+                   "/oak/stanford/groups/amnewman/fidelia/Genes.txt", feature.column = 1)
+obj <- CreateSeuratObject(counts = matrix, project = "CRC", min.cells = 3, min.features = 200)
+
+cells_metadata <- read.csv("/oak/stanford/groups/amnewman/fidelia/Cells2.csv", row.names = 1)
+
+#the seurat object filtered out cells that did not meet this requirement: min.cells = 3, min.features = 200 -- here, identifying the filtered out cells
+filtered_out_cells <- cells_metadata[!rownames(cells_metadata)%in%rownames(obj@meta.data), ]
+
+clean_cells_metadata <- cells_metadata[-which(rownames(cells_metadata) == rownames(filtered_out_cells)), ]
+
+#Here, we have object with cell name as rownames, and metadata all included 
+obj <- AddMetaData(obj, clean_cells_metadata, col.name = NULL)
+
+#Remove patient sample 119 and 136 since it does not contain paired tumor cells
+obj <- subset(x = obj, subset = orig.ident != "C136")
+obj <- subset(x = obj, subset = orig.ident != "C119")
+
+#Subset to various seurat objects of interest
+normal_obj <- subset(x = obj, subset = sample_type == "Normal")
+tumor_obj <- subset(x = obj, subset = sample_type == "Tumor")
+epithelial_normal_obj <- subset(x = normal_obj, subset = cell_type == "Epithelial")
+malignant_tumor_obj <- subset(x = tumor_obj, subset = cell_type == "Malignant")
+
+```
+
+```{r}
+#Data Processing and Integration (these steps were done for normal_obj, tumor_obj, epithelial_normal_obj and malignant_tumor_obj), code written here is a representative code demonstrated for normal_obj processing
+
+#Standard Seurat Workflow (Pre-processing, Normalization, Identification of highly variable features, Scaling data, Linear dimensional reduction, Cluster cells, Run non-dimensional reduction UMAP)
+normal_obj[["percent.mt"]] <- PercentageFeatureSet(normal_obj, pattern = "^MT-")
+normal_obj <- subset (x = normal_obj, subset = nFeature_RNA > 200 & percent.mt < 30)
+normal_obj[["RNA"]] <- split(normal_obj[["RNA"]], f = normal_obj$sample)
+normal_obj <- NormalizeData(normal_obj)
+normal_obj <- FindVariableFeatures(normal_obj)
+all.genes <- rownames(normal_obj)
+normal_obj <- ScaleData(normal_obj, features = all.genes)
+normal_obj <- RunPCA(normal_obj)
+
+#ElbowPlot indicates that it should be PC30
+normal_obj <- FindNeighbors(normal_obj, dims = 1:30)
+normal_obj <- FindClusters(normal_obj, resolution = 0.5)
+normal_obj <- RunUMAP(normal_obj, dims = 1:30)
+
+#View and Save UMAP before integration, grouping them by metadata of cell_type annotations (for malignant and epithelial obj, it is grouped by cell_subtype annotations)
+png("./normal_obj_preintegration_celltype.png", width = 800, height = 700, res = 100)
+DimPlot(normal_obj, group.by = "cell_type", reduction = "umap", repel = TRUE, label = TRUE)
+dev.off()
+
+png("./normal_obj_preintegration_sample.png", width = 800, height = 700, res = 100)
+DimPlot(normal_obj, group.by = "sample", reduction = "umap", repel = TRUE)
+dev.off()
+
+#Seurat Integration 
+normal_obj <- IntegrateLayers(object = normal_obj, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca",
+    verbose = FALSE)
+
+#Re-join layers after integration
+normal_obj[["RNA"]] <- JoinLayers(normal_obj[["RNA"]])
+
+normal_obj <- FindNeighbors(normal_obj, reduction = "integrated.cca", dims = 1:30)
+normal_obj <- FindClusters(normal_obj, resolution = 0.5)
+normal_obj <- RunUMAP(normal_obj, dims = 1:30, reduction = "integrated.cca")
+
+#View and Save UMAP after integration
+png("./normal_obj_afterintegration_celltype.png", width = 800, height = 700, res = 100)
+DimPlot(normal_obj, group.by = "cell_type", reduction = "umap", repel = TRUE, label = TRUE)
+dev.off()
+
+png("./normal_obj_afterintegration_sample.png", width = 800, height = 700, res = 100)
+DimPlot(normal_obj, group.by = "sample", reduction = "umap", repel = TRUE)
+dev.off()
+
+#Save Object 
+saveRDS(normal_obj, file = "/oak/stanford/groups/amnewman/fidelia/normal_obj.rds")
+```
+
+```{r}
+#Verification of Stemness using well-established markers
+
+#Load the malignant and epithelial object 
+malignant_tumor_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/malignant_obj.rds")
+epithelial_normal_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/epithelial_obj.rds")
+
+#Colon stem cell markers (This same code was run for other markers too: BMI1, LGR5)
+png("./HES1_epithelial_VlnPlot.png", width = 500, height = 800, res = 100)
+VlnPlot(epithelial_normal_obj, features = c("HES1"), group.by = "cell_subtype") + theme(axis.text.x = element_text(angle = 75, hjust = 1), legend.position = 'none')
+dev.off()
+
+#CRC stem cell markers (This same code was run for other CRC stem cell markers too: LGR5, CXCR4)
+png("./ALCAM_malignant_VlnPlot.png", width = 500, height = 800, res = 100)
+VlnPlot(malignant_tumor_obj, features = c("ALCAM"), group.by = "cell_subtype") + theme(axis.text.x = element_text(angle = 75, hjust = 1), legend.position = 'none')
+dev.off()
+
+```
+
+```{r}
+#Verification of Stemness using CytoTRACE (Representative code, this code was also run on epithelial_normal_obj)
+malignant_metadata <- malignant_tumor_obj@meta.data
+
+#CytoTRACE processing 
+cytotrace_list <- list()
+
+for (i in 1:length(unique(malignant_tumor_obj$sample))){
+    #creating individual object
+    sample_name <- patient_sample[i]
+    subset_obj <- subset(x = malignant_tumor_obj, subset = sample == sample_name)
+
+    #making gene expression matrix
+    matrix <- subset_obj[["RNA"]]$counts
+    matrix <- as.matrix(matrix)
+
+    #CytoTRACE processing
+    results <- CytoTRACE(matrix)
+    cytotrace_scores <- results$CytoTRACE
+
+    cytotrace_list <- c(cytotrace_list, cytotrace_scores)
+}
+
+#Adding cytotrace metadata
+cytotrace_df <- as.data.frame(cytotrace_list)
+cytotrace_df <- t(cytotrace_df)
+cytotrace_df_rownames <- rownames(cytotrace_df)
+cytotrace_df_rownames <- gsub('\\.', '-', cytotrace_df_rownames)
+rownames(cytotrace_df) <- cytotrace_df_rownames
+malignant_tumor_obj <- AddMetaData(malignant_tumor_obj, cytotrace_df, col.name = "CytoTRACE_Score")
+malignant_metadata <- malignant_tumor_obj@meta.data
+
+stat.test <- malignant_metadata %>% 
+  wilcox_test(CytoTRACE_Score ~ cell_subtype) %>%
+  add_significance()
+stat_df <- as.data.frame(stat.test)
+
+CytoTRACE_plot <- ggplot(malignant_metadata, aes(x= cell_subtype, y= CytoTRACE_Score, fill= cell_subtype)) + geom_boxplot() + theme(legend.position = "none") + theme(axis.text.x = element_text(angle = 70, hjust = 1))
+
+#comparison with cE01 (Stem/TA-like) p-value. This same code was also used for comparison of the differentaited cells with the other two stem cell clusters
+c1_c4 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE04 (Enterocyte 1)")
+c1_c5 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE05 (Enterocyte 2)")
+c1_c6 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE06 (Immature Goblet)")
+c1_c7 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE07 (Goblet/Enterocyte)")
+c1_c8 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE08 (Goblet)")
+c1_c9 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE09 (Best4)")
+c1_c10 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE10 (Tuft)")
+c1_c11 <- subset(stat_df, group1 == "cE01 (Stem/TA-like)" & group2 == "cE11 (Enteroendocrine)")
+
+#Add the pvalue significance in the form of asterisks into the plot
+Final_CytoTRACE_Plot <- (CytoTRACE_plot 
++ annotate("text", x = 4, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c4$p.adj.signif, size = 4, color = "#F8766D") 
++ annotate("text", x = 5, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c5$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 6, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c6$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 7, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c7$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 8, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c8$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 9, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c9$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 10, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c10$p.adj.signif, size = 4, color = "#F8766D")
++ annotate("text", x = 11, y = max(malignant_metadata$CytoTRACE_Score) + 0.3, label = c1_c11$p.adj.signif, size = 4, color = "#F8766D")
+
+#+ .... same annotations was added like above, placing the asterisks at different y values, to indicate the p value of comparisons with the other two stem cell clusters
+
+)
+
+#Save final cytotrace plot
+png("./malignant_CytoTRACE_Plot.png", width = 1000, height = 700, res = 100)
+Final_CytoTRACE_Plot
+dev.off()
+```
+
+```{r}
+#CellChat Analysis [Creating Object]
+
+#Load the malignant and epithelial object 
+malignant_tumor_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/malignant_obj.rds")
+epithelial_normal_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/epithelial_obj.rds")
+
+#Merge the 3 stem cell populations into 1 (Representative code, similar code was run for epithelial_normal_obj)
+malignant_metadata <- malignant_tumor_obj@meta.data
+malignant_metadata['cell_subtype'][malignant_metadata['cell_subtype'] == "cE01 (Stem/TA-like)" | malignant_metadata['cell_subtype'] == "cE02 (Stem/TA-like/Immature Goblet)" | malignant_metadata['cell_subtype'] == "cE03 (Stem/TA-like prolif)"]  <- "Stem Cells"
+malignant_tumor_obj@meta.data <- malignant_metadata
+
+#Create CellChat Object (Representative code, similar code was run for epithelial_normal_obj)
+data.input <- GetAssayData(malignant_tumor_obj, assay = "RNA", layer = "data")
+labels <- Idents(malignant_tumor_obj)
+meta <- malignant_tumor_obj@meta.data
+cellchat_malignant <- createCellChat(object = data.input, meta = meta, group.by = "cell_subtype")
+
+#Load human database
+CellChatDB <- CellChatDB.human
+#Ligand-receptor categories
+showDatabaseCategory(CellChatDB)
+
+CellChatDB.use <- CellChatDB
+cellchat_epithelial@DB <- CellChatDB.use
+cellchat_malignant@DB <- CellChatDB.use
+
+#CellChat Analysis (Representative code, from here on similar code was run for epithelial_normal_obj)
+cellchat_malignant <- subsetData(cellchat_malignant)
+cellchat_malignant <- identifyOverExpressedGenes(cellchat_malignant)
+cellchat_malignant <- identifyOverExpressedInteractions(cellchat_malignant)
+cellchat_malignant <- computeCommunProb(cellchat_malignant)
+cellchat_malignant <- filterCommunication(cellchat_malignant, min.cells = 10)
+
+#infer cell-cell communication at a signaling pathway level
+cellchat_malignant <- computeCommunProbPathway(cellchat_malignant)
+
+#calculate aggregated cell-cell communication network
+cellchat_malignant <- aggregateNet(cellchat_malignant)
+
+#Compute the network centrality scores 
+cellchat_malignant <- netAnalysis_computeCentrality(cellchat_malignant, slot.name = "netP")
+
+#Identify and visualize outgoing communication pattern of secreting cells
+selectK(cellchat_malignant, pattern = "outgoing") 
+nPatterns = 2 
+cellchat_malignant <- identifyCommunicationPatterns(cellchat_malignant, pattern = "outgoing",
+                                      k = nPatterns, width = 5, height = 9)
+
+#Identify and visualize incoming communication pattern of target cells
+selectK(cellchat_malignant, pattern = "incoming")
+nPatterns = 4
+cellchat_malignant <- identifyCommunicationPatterns(cellchat_malignant,pattern = "incoming", 
+                                      k = nPatterns, width = 5, height = 9)
+
+#Identify signaling groups based on functional similarity
+cellchat_malignant <- computeNetSimilarity(cellchat_malignant, type = "functional")
+cellchat_malignant <- netEmbedding(cellchat_malignant, type = "functional")
+cellchat_malignant <- netClustering (cellchat_malignant, type = "functional", do.parallel = FALSE)
+
+#Identify signaling groups based on structure similarity
+cellchat_malignant <- computeNetSimilarity(cellchat_malignant, type = "structural")
+cellchat_malignant <- netEmbedding(cellchat_malignant, type = "structural")
+cellchat_malignant <- netClustering(cellchat_malignant, type = "structural", do.parallel = FALSE)
+
+#Save Object
+saveRDS(cellchat_malignant, file = "./cellchat_malignant_merged_analysed.rds")
+```
+
+```{r}
+#CellChat Analysis [Direct Comparison between malignant and epithelial CellChat Object]
+
+#Load the malignant and epithelial cellchat object 
+malignantmerged_cellchat <- readRDS("/oak/stanford/groups/amnewman/fidelia/cellchat_malignant_merged_analysed.rds")
+epithelialmerged_cellchat <- readRDS("/oak/stanford/groups/amnewman/fidelia/cellchat_epithelial_merged_analysed.rds")
+
+#Analyze the cell-cell communication network (interaction strength) in malignant population (Representative code, similar code was run for epithelial cellchat object)
+groupSize <- as.numeric(table(malignantmerged_cellchat@idents))
+malignant_strength <- netVisual_circle(malignantmerged_cellchat@net$weight, vertex.weight = groupSize, 
+   weight.scale = T, label.edge= F, title.name
+ = "Interaction weights/strength", vertex.label.cex = 0.8)
+
+#Merge cellchat into one object 
+object.list <- list(epithelial = epithelialmerged_cellchat, malignant = malignantmerged_cellchat)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+rm(epithelialmerged_cellchat, malignantmerged_cellchat)
+
+#Differential Interaction Strength Analysis
+netVisual_diffInteraction(cellchat, comparison = c(1, 2), measure = "weight", 
+                          weight.scale = T, arrow.size = 0.1)
+
+#Heatmap of differential interaction strength 
+netVisual_heatmap(cellchat, comparison = c(1, 2), measure = "weight")
+
+# Heatmap of Incoming signaling pattern in epithelial cellchat object (ht1) and malignant cellchat object (ht2)
+# combining all the identified signaling pathways from different datasets 
+all_pathways <- union(object.list[[1]]@netP$pathways, 
+                       object.list[[2]]@netP$pathways)
+
+ht1 = netAnalysis_signalingRole_heatmap(object.list[[1]], pattern = "incoming", 
+      signaling = all_pathways, title = names(object.list)[1],  
+      width = 5, height = 11, color.heatmap = "OrRd")
+ht2 = netAnalysis_signalingRole_heatmap(object.list[[2]], pattern = "incoming", 
+      signaling = all_pathways, title = names(object.list)[2], 
+      width = 5, height = 11, color.heatmap = "OrRd")
+
+#Chord Diagram of where new incoming signaling found in CRC stem cells is coming from
+netVisual_chord_gene(malignantmerged_cellchat, sources.use = c(1:8), targets.use = 9,
+                     signaling = c("AGRN", "ANGPTL", "GRN"),legend.pos.x = 10, legend.pos.y = 5, lab.cex = 0.8)
+
+#Bubble Plot of where new incoming signaling found in CRC stem cells is coming from 
+netVisual_bubble(malignantmerged_cellchat, sources.use = c(1:8), targets.use = 9, 
+                 signaling = c("AGRN", "ANGPTL", "GRN"), remove.isolate = FALSE)
+```
+
+```{r}
+#DGE analysis and GO enrichment analysis between CRC stem cells and colon stem cells 
+
+#Load the malignant and epithelial object 
+malignant_tumor_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/malignant_obj.rds")
+epithelial_normal_obj <- readRDS("/oak/stanford/groups/amnewman/fidelia/epithelial_obj.rds")
+
+#Rename 3 stem cell clusters and identify them as one cluster (Representative code, similar code is run for epithelial_normal_obj) 
+malignant_metadata <- malignant_tumor_obj@meta.data
+malignant_metadata['cell_subtype'][malignant_metadata['cell_subtype'] == "cE01 (Stem/TA-like)" | malignant_metadata['cell_subtype'] == "cE02 (Stem/TA-like/Immature Goblet)" | malignant_metadata['cell_subtype'] == "cE03 (Stem/TA-like prolif)"]  <- "Malignant_StemCells"
+malignant_tumor_obj@meta.data <- malignant_metadata
+
+##Merge subsetted data
+obj <- merge(malignant_tumor_obj, y = epithelial_normal_obj, add.cell.ids = c("Malignant", "Epithelial"), project = "Combined")
+obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+
+#Find DE features between cell types
+Idents(obj) <- "cell_subtype"
+celltype_de_markers <- FindMarkers(obj, ident.1 = "Malignant_StemCells", ident.2 = "Epithelial_StemCells", test.use = "wilcox", logfc.threshold = 0.1)
+
+#1 (Malignant_StemCells) is positive 
+#2 (Epithelial_StemCells) is negative values
+
+#View results
+head(celltype_de_markers)
+
+#Multiple hypothesis correction using bonferroni 
+celltype_de_markers$p_val_adj <- p.adjust(celltype_de_markers$p_val, method= "bonferroni")
+head(celltype_de_markers)
+
+#sort based on avg_log2FC
+sorted_data <- celltype_de_markers[order(celltype_de_markers$avg_log2FC, decreasing = TRUE), ]
+
+topupregulatedgenes <- rownames(head(sorted_data, n = 5))
+bottomdownregulatedgenes <- rownames(tail(sorted_data, n = 5))
+gene_list <- c(topupregulatedgenes, bottomdownregulatedgenes)
+
+#Volcano plot 
+Volcano_Plot <- EnhancedVolcano(
+  celltype_de_markers,
+  lab = rownames(celltype_de_markers),
+  x = 'avg_log2FC',
+  y = 'p_val_adj',
+  title = "Differentially Expressed Genes between CRC Stem Cells and Colon Stem Cells",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  pointSize = 3,
+  selectLab = gene_list, 
+  drawConnectors = TRUE, 
+  arrowheads = FALSE
+)
+
+#Separate positive and negative values 
+#Filter based on p-value adj p_val_adj > 0.05
+markers_test = celltype_de_markers[(celltype_de_markers$p_val_adj<0.05),]
+pos_only = markers_test[(markers_test$avg_log2FC > 1),]
+neg_only = markers_test[(markers_test$avg_log2FC < -1),]
+
+#Perform GO term enrichment analysis on both the positive and negative values 
+#Positive [CRC Stem Cells]
+enrichment_result_pos <- enrichGO(
+  gene = rownames(pos_only),
+  OrgDb = org.Hs.eg.db, 
+  keyType = "SYMBOL",
+  ont = "BP",  
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+#Visualize results
+barplot(enrichment_result_pos, showCategory = 20)
+
+#Negative [Colon Stem Cells]
+enrichment_result_neg <- enrichGO(
+  gene = rownames(neg_only),
+  OrgDb = org.Hs.eg.db, 
+  keyType = "SYMBOL",
+  ont = "BP",  
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+#Visualize results
+barplot(enrichment_result_neg , showCategory = 20)
+```
+
+
+
